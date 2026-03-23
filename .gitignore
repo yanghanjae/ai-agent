@@ -11,3 +11,4 @@ venv312.bak/
 data/
 output/
 audio/
+chroma_store/
