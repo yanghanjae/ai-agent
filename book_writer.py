@@ -31,6 +31,72 @@ class State(TypedDict):
     messages: List[AnyMessage | str]
     task_history: List[Task]
     references: dict
+    user_request: str
+    ai_recommendation: str  # AI의 추천을 저장하는 변수
+    supervisor_call_count: int  # supervisor 호출 횟수를 저장하는 변수
+
+
+def business_analyst(state: State):
+    print("\n\n============ BUSINESS ANALYST ============")
+
+    business_analyst_system_prompt = PromptTemplate.from_template(
+        """
+        너는 책을 쓰는 AI팀의 비즈니스 애널리스트로서, 
+        AI팀의 진행상황과 "사용자 요구사항"을 토대로,
+        현 시점에서 'ai_recommendation'과 최근 사용자의 발언을 바탕으로 요구사항이 무엇인지 판단한다.
+        지난 요청사항이 달성되었는지 판단하고, 현 시점에서 어떤 작업을 해야 하는지 결정한다.
+
+        다음과 같은 템플릿 형태로 반환한다. 
+```
+        - 목표: OOOO \n 방법: OOOO
+```
+
+        ------------------------------------
+        *AI 추천(ai_recommendation)* : {ai_recommendation}
+        ------------------------------------
+        사용자 최근 발언: {user_last_comment}
+        ------------------------------------
+        참고자료: {references}
+        ------------------------------------
+        목차 (outline): {outline}
+        ------------------------------------
+        "messages": {messages}
+        """
+    )
+
+    ba_chain = business_analyst_system_prompt | llm | StrOutputParser()
+
+    messages = state["messages"]
+
+    user_last_comment = None
+    for m in messages[::-1]:
+        if isinstance(m, HumanMessage):
+            user_last_comment = m.content
+            break
+
+    inputs = {
+        "ai_recommendation": state.get("ai_recommendation", None),
+        "previous_user_request": state.get("user_request", None),
+        "references": state.get("references", {"queries": [], "docs": []}),
+        "outline": get_outline(current_path),
+        "messages": messages,
+        "user_last_comment": user_last_comment
+    }
+
+    user_request = ba_chain.invoke(inputs)
+
+    business_analyst_message = f"[Business Analyst] {user_request}"
+    print(business_analyst_message)
+    messages.append(AIMessage(business_analyst_message))
+
+    save_state(current_path, state)
+
+    return {
+        "messages": messages,
+        "user_request": user_request,
+        "ai_recommendation": ""
+    }
+
 
 def supervisor(state: State):
     print("\n\n============ SUPERVISOR ============")
@@ -44,8 +110,8 @@ def supervisor(state: State):
         supervisor가 활용할 수 있는 agent는 다음과 같다.     
         - content_strategist: 사용자의 요구사항이 명확해졌을 때 사용한다. AI 팀의 콘텐츠 전략을 결정하고, 전체 책의 목차(outline)를 작성한다. 
         - communicator: AI 팀에서 해야 할 일을 스스로 판단할 수 없을 때 사용한다. 사용자에게 진행상황을 사용자에게 보고하고, 다음 지시를 물어본다. 
-        - web_search_agent: 웹 검색을 통해 목차(outline) 작성에 필요한 정보를 확보한다.
-        - vector_search_agent: 벡터 DB 검색을 통해 목차(outline) 작성에 필요한 정보를 확보한다.
+        - web_search_agent: vector_search_agent를 시도하고, 검색 결과(references)에 필요한 정보가 부족한 경우 사용한다. 웹 검색을 통해 해당 정보를 Vector DB에 보강한다. 
+        - vector_search_agent: 목차 작성을 위해 필요한 자료를 확보하기 위해 벡터 DB 검색을 한다. 
 
         반드시 아래 네 값 중 하나만 agent로 선택하라.
         - content_strategist
@@ -70,7 +136,19 @@ def supervisor(state: State):
         "outline": get_outline(current_path)
     }
 
-    task = supervisor_chain.invoke(inputs)
+    supervisor_call_count = state.get("supervisor_call_count", 0)
+
+    if supervisor_call_count > 2:
+        print("Supervisor 호출 횟수 초과: Communicator 호출")
+        task = Task(
+            agent="communicator",
+            done=False,
+            description="supervisor 호출 횟수 초과했으므로, 현재까지의 진행상황을 사용자에게 보고한다.",
+            done_at="",
+        )
+    else:
+        task = supervisor_chain.invoke(inputs)
+
     task_history = state.get("task_history", [])
     task_history.append(task)
 
@@ -80,7 +158,8 @@ def supervisor(state: State):
 
     return {
         "messages": messages,
-        "task_history": task_history
+        "task_history": task_history,
+        "supervisor_call_count": supervisor_call_count + 1
     }
 
 # supervisor's route
@@ -161,28 +240,28 @@ def vector_search_agent(state: State):
     tasks[-1].done = True
     tasks[-1].done_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    new_task = Task(
-        agent="communicator",
-        done=False,
-        description="AI팀의 진행상황을 사용자에게 보고하고, 사용자의 의견을 파악하기 위한 대화를 나눈다",
-        done_at=""
-    )
-    tasks.append(new_task)
-
     msg_str = f"[VECTOR SEARCH AGENT] 다음 질문에 대한 검색 완료: {queries}"
     message = AIMessage(msg_str)
     print(msg_str)
 
     messages.append(message)
+    ai_recommendation = "현재 참고자료(references)가 목차(outline)를 개선하는데 충분한지 확인하라. 충분하다면 content_strategist로 목차 작성을 하라. "
+
     return {
         "messages": messages,
         "task_history": tasks,
-        "references": references
+        "references": references,
+        "ai_recommendation": ai_recommendation
     }
 
 
 def content_strategist(state: State):
     print("\n\n============ CONTENT STRATEGIST ============")
+
+    task_history = state.get("task_history", [])
+    task = task_history[-1]
+    if task.agent != "content_strategist":
+        raise ValueError(f"Content Strategist가 아닌 agent가 목차 작성을 시도하고 있습니다.\n {task}")
 
     content_strategist_system_prompt = PromptTemplate.from_template(
         """
@@ -191,25 +270,70 @@ def content_strategist(state: State):
 
         지난 목차가 있다면 그 버전을 사용자의 요구에 맞게 수정하고, 없다면 새로운 목차를 제안한다.
         목차를 작성하는데 필요한 정보는 "참고 자료"에 있으므로 활용한다. 
+        
+        다음 정보를 활용하여 목차를 작성하라. 
+        - 사용자 요구사항(user_request)
+        - 작업(task)
+        - 검색 자료 (references)
+        - 기존 목차 (previous_outline)
+        - 이전 대화 내용(messages)
+
+        너의 작업 목표는 다음과 같다:
+        1. 만약 "기존 목차 구조 (previous_outline)"이 존재한다면, 사용자의 요구사항을 토대로 "기존 목차 구조"에서 어떤 부분을 수정하거나 추가할지 결정한다.
+        - "이번 목차 작성의 주안점"에 사용자 요구사항(user_request)을 충족시키는 것을 명시해야 한다.
+        2. 책의 전반적인 구조(chapter, section)를 설계하고, 각 chpater와 section의 제목을 정한다.
+        3. 책의 전반적인 세부구조(chapter, section, sub-section)를 설계하고, sub-section 하부의 주요 내용을 리스트 형태로 정리한다.
+        4. 목차의 논리적인 흐름이 사용자 요구를 충족시키는지 확인한다.
+        5. 참고자료 (references)를 적극 활용하여 근거에 기반한 목차를 작성한다.
+        6. 참고문헌은 반드시 참고자료(references) 자료를 근거로 작성해야 하며, 최대한 풍부하게 준비한다. URL은 전체 주소를 적어야 한다.
+        7. 추가 자료나 리서치가 필요한 부분을 파악하여 supervisor에게 요청한다.
+
+        사용자 요구사항(user_request)을 최우선으로 반영하는 목차로 만들어야 한다. 
 
         --------------------------------
-        - 지난 목차: {outline}
+        - 사용자 요구사항(user_request): 
+        {user_request}
         --------------------------------
-        - 이전 대화 내용: {messages}
+        - 작업(task): 
+        {task}
         --------------------------------
-        - 참고 자료: {references}
+        - 참고 자료 (references)
+        {references}
+        --------------------------------
+        - 기존 목차 (previous_outline)
+        {outline}
+        --------------------------------
+        - 이전 대화 내용(messages)
+        {messages}
+        --------------------------------
+
+        작성 형식 아래 양식을 지키되 하부 항목으로 더 세분화해도 좋다. 목차(outline) 양식의 챕터, 섹션 등 항목의 갯수는 필요한만큼 추가하라. 
+        섹션 갯수는 최소 2개 이상이어야 하며, 더 많으면 좋다. 
+
+        outline_template은 예시로 앞부분만 제시한 것이다. 각 장은 ':---CHAPTER DIVIDER---:'로 구분한다.
+        outline_template:
+        {outline_template}
+
+        사용자가 추가 피드백을 제공할 수 있도록 논리적인 흐름과 주요 목차 아이디어를 제안하라.    
         """
     )
 
     content_strategist_chain = content_strategist_system_prompt | llm | StrOutputParser()
 
+    user_request = state.get("user_request", "")
     messages = state["messages"]
     outline = get_outline(current_path)
 
+    with open(f"{current_path}/templates/outline_template.md", "r", encoding='utf-8') as f:
+        outline_template = f.read()
+
     inputs = {
+        "user_request": user_request,
+        "task": task,
         "messages": messages,
         "outline": outline,
-        "references": state.get("references", {"queries": [], "docs": []})
+        "references": state.get("references", {"queries": [], "docs": []}),
+        "outline_template": outline_template
     }
 
     gathered = ''
@@ -221,30 +345,100 @@ def content_strategist(state: State):
 
     save_outline(current_path, gathered)
 
-    content_strategist_message = f"[Content Strategist] 목차 작성 완료"
+    if '-----: DONE :-----' in gathered:
+        review = gathered.split('-----: DONE :-----')[1]
+    else:
+        review = gathered[-200:]
+
+    content_strategist_message = f"[Content Strategist] 목차 작성 완료: outline 작성 완료\n {review}"
     print(content_strategist_message)
     messages.append(AIMessage(content_strategist_message))
 
-    task_history = state.get("task_history", [])
-    if task_history[-1].agent != "content_strategist":
-        raise ValueError(f"Content Strategist가 아닌 agent가 목차 작성을 시도하고 있습니다.\n {task_history[-1]}")
-
     task_history[-1].done = True
     task_history[-1].done_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    new_task = Task(
-        agent="communicator",
-        done=False,
-        description="AI팀의 진행상황을 사용자에게 보고하고, 사용자의 의견을 파악하기 위한 대화를 나눈다",
-        done_at=""
-    )
-    task_history.append(new_task)
-    print(new_task)
 
     return {
         "messages": messages,
         "task_history": task_history
     }
+
+
+def outline_reviewer(state: State):
+    print("\n\n============ OUTLINE REVIEWER ============")
+
+    outline_reviewer_system_prompt = PromptTemplate.from_template(
+        """
+        너는 AI팀의 목차 리뷰어로서, AI팀이 작성한 목차(outline)를 검토하고 문제점을 지적한다. 
+
+        - outline이 사용자의 요구사항을 충족시키는지 여부
+        - outline의 논리적인 흐름이 적절한지 여부
+        - 근거에 기반하지 않은 내용이 있는지 여부
+        - 주어진 참고자료(references)를 충분히 활용했는지 여부
+        - 참고자료가 충분한지, 혹은 잘못된 참고자료가 있는지 여부
+        - example.com 같은 더미 URL이 있는지 여부: 
+        - 실제 페이지 URL이 아닌 대표 URL로 되어 있는 경우 삭제 해야함: 어떤 URL이 삭제되어야 하는지 명시하라.
+        - 기타 리뷰 사항
+
+        그 분석 결과를 설명하고, 다음 어떤 작업을 하면 좋을지 제안하라.
+        
+        - 분석결과: outline이 사용자의 요구사항을 충족시키는지 여부
+        - 제안사항: (vector_search_agent, communicator 중 어떤 agent를 호출할지)
+
+        ------------------------------------------
+        user_request: {user_request}
+        ------------------------------------------
+        references: {references}
+        ------------------------------------------
+        outline: {outline}
+        ------------------------------------------
+        messages: {messages}
+        """
+    )
+
+    user_request = state.get("user_request", None)
+    outline = get_outline(current_path)
+    references = state.get("references", {"queries": [], "docs": []})
+    messages = state.get("messages", [])
+
+    inputs = {
+        "user_request": user_request,
+        "outline": outline,
+        "references": references,
+        "messages": messages
+    }
+
+    outline_reviewer_chain = outline_reviewer_system_prompt | llm
+
+    review = outline_reviewer_chain.stream(inputs)
+
+    gathered = None
+
+    for chunk in review:
+        content = chunk.content
+        if isinstance(content, list) and len(content) > 0:
+            content = content[0].get("text", "")
+        if content:
+            print(content, end='')
+
+        if gathered is None:
+            gathered = chunk
+        else:
+            gathered += chunk
+
+    # content 추출
+    gathered_content = gathered.content
+    if isinstance(gathered_content, list) and len(gathered_content) > 0:
+        gathered_content = gathered_content[0].get("text", "")
+
+    if '[OUTLINE REVIEW AGENT]' not in gathered_content:
+        gathered_content = f"[OUTLINE REVIEW AGENT] {gathered_content}"
+
+    print(gathered_content)
+    messages.append(AIMessage(gathered_content))
+
+    ai_recommendation = gathered_content
+
+    return {"messages": messages, "ai_recommendation": ai_recommendation}
 
 
 def web_search_agent(state: State):
@@ -374,7 +568,8 @@ def communicator(state: State):
 
     return {
         "messages": messages,
-        "task_history": task_history
+        "task_history": task_history,
+        "supervisor_call_count": 0  # 사용자와 대화 후 초기화
     }
 
 
@@ -382,14 +577,17 @@ def communicator(state: State):
 graph_builder = StateGraph(State)
 
 # Nodes
+graph_builder.add_node("business_analyst", business_analyst)
 graph_builder.add_node("supervisor", supervisor)
 graph_builder.add_node("communicator", communicator)
 graph_builder.add_node("content_strategist", content_strategist)
+graph_builder.add_node("outline_reviewer", outline_reviewer)
 graph_builder.add_node("vector_search_agent", vector_search_agent)
 graph_builder.add_node("web_search_agent", web_search_agent)
 
 # Edges
-graph_builder.add_edge(START, "supervisor")
+graph_builder.add_edge(START, "business_analyst")
+graph_builder.add_edge("business_analyst", "supervisor")
 graph_builder.add_conditional_edges(
     "supervisor",
     supervisor_router,
@@ -400,9 +598,10 @@ graph_builder.add_conditional_edges(
         "web_search_agent": "web_search_agent"
     }
 )
-graph_builder.add_edge("content_strategist", "communicator")
+graph_builder.add_edge("content_strategist", "outline_reviewer")
+graph_builder.add_edge("outline_reviewer", "business_analyst")
 graph_builder.add_edge("web_search_agent", "vector_search_agent")
-graph_builder.add_edge("vector_search_agent", "communicator")
+graph_builder.add_edge("vector_search_agent", "business_analyst")
 graph_builder.add_edge("communicator", END)
 
 graph = graph_builder.compile()
@@ -422,7 +621,10 @@ state = State(
         )
     ],
     task_history=[],
-    references={"queries": [], "docs": []}
+    references={"queries": [], "docs": []},
+    user_request="",
+    ai_recommendation="",
+    supervisor_call_count=0
 )
 
 while True:

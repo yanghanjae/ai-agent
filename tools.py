@@ -69,10 +69,11 @@ def web_search(query: str):
     with open(resources_json_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
 
-    return results, resources_json_path
+    return results, resources_json_path  # 검색 결과와 JSON 파일 경로 반환
 
 
 def web_page_to_document(web_page):
+    # raw_content와 content 중 정보가 많은 것을 page_content로 한다.
     if len(web_page['raw_content']) > len(web_page['content']):
         page_content = web_page['raw_content']
     else:
@@ -129,7 +130,7 @@ def documents_to_chroma(documents, chunk_size=1000, chunk_overlap=100):
     splits = split_documents(new_documents, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
     if splits:
-        # 20개씩 나눠서 저장 + 대기
+        # 임베딩 한도 초과 방지: 10개씩 나눠서 저장
         batch_size = 10
         for i in range(0, len(splits), batch_size):
             batch = splits[i:i+batch_size]
@@ -173,23 +174,5 @@ def retrieve(query: str, top_k: int=5):
 
 
 if __name__ == "__main__":
-    # 1. 웹 검색으로 데이터 수집
-    queries = [
-        "HYBE JYP 경영 전략 비교 2026",
-        "하이브 멀티레이블 JYP 본부제 비교",
-        "위버스 버블 팬덤 플랫폼 비교",
-        "HYBE JYP 글로벌 전략 비교",
-    ]
-
-    for query in queries:
-        print(f"\n검색 중: {query}")
-        results, json_path = web_search.invoke(query)
-        print(f"저장된 파일: {json_path}")
-        add_web_pages_json_to_chroma(json_path)
-
-    # 2. 검색 테스트
-    print("\n=== 검색 테스트 ===")
-    retrieved_docs = retrieve.invoke({"query": "HYBE JYP 비교"})
-    for doc in retrieved_docs:
-        print(doc.page_content[:200])
-        print('---')
+    retrieved_docs = retrieve.invoke({"query": "한국 경제 위험 요소"})
+    print(retrieved_docs)
